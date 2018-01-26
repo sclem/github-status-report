@@ -1,0 +1,195 @@
+#!/bin/bash
+
+set -e
+
+if [ -z $GITHUB_TOKEN ]; then
+    echo '$GITHUB_TOKEN must be defined as env'
+    exit 1
+fi
+
+if [ $# -lt 1 ]; then
+    echo "usage: generatereport <owner/repo>"
+    exit 1
+fi
+
+INDATE=$2
+if [ -z "$INDATE" ]; then
+    INDATE="last monday"
+fi
+
+REPO=$1
+
+API_URL="https://api.github.com/repos/$REPO"
+
+BEGINDATESTR=$(date --date="$INDATE")
+BEGINDATEISO=$(date --date="$BEGINDATESTR" --iso-8601='seconds' -u)
+BEGINDATETIMESTAMP=$(date --date="$BEGINDATESTR" "+%s" -u)
+
+#github lumps issues and prs together, loop because github paginates
+function get_github_data() {
+    typeissuepr=$1
+    memdir=/dev/shm/github/$REPO
+    rm -rf $memdir
+    mkdir -p $memdir
+    page=1
+    while true; do
+        curl -L -s \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            "$API_URL/$typeissuepr?state=all&per_page=100&page=$page&since=$BEGINDATEISO" > $memdir/$page.json
+        len=$(cat $memdir/$page.json | jq -r 'length')
+        if [ $len -lt 100 ]; then
+            break
+        fi
+        #pull requests dont support 'since' param
+        if [ $typeissuepr == "pulls" ]; then
+            break
+        fi
+        page=$(($page+1))
+    done
+    # concatenate
+    jq -s '[.[][]]' $memdir/*.json
+    rm -rf $memdir
+}
+
+function print_prs() {
+    if [ $(echo $1 | jq -r 'length') -eq 0 ]; then
+        echo "Nothing to report"
+        return 0
+    fi
+    echo $1 | \
+        jq -r 'map([.title, .html_url, .user.login] | @csv) | join("\n")' | \
+        awk -vFPAT='([^,]*)|("[^"]+")' '
+        {
+            title=$1;
+            link=$2;
+            user=$3;
+            gsub("\"", "", user);
+            gsub("\"", "", link);
+            printf("%d. %s: %s. Link: %s\n", NR, title, user, link);
+        };
+        '
+}
+
+function print_issues() {
+    if [ $(echo $1 | jq -r 'length') -eq 0 ]; then
+        echo "Nothing to report"
+        return 0
+    fi
+    echo $1 | \
+        jq -r 'map([.title, .html_url, .user.login] | @csv) | join("\n")' | \
+        awk -vFPAT='([^,]*)|("[^"]+")' '
+        {
+            title=$1;
+            link=$2;
+            user=$3;
+            gsub("\"", "", user);
+            gsub("\"", "", link);
+            printf("%d. %s: %s. Link: %s\n", NR, title, user, link);
+        };
+        '
+}
+
+function get_latest_release() {
+    curl -L -s \
+        -H "Authorization: token $GITHUB_TOKEN" \
+        $API_URL/releases/latest \
+        | jq -r '[.tag_name, .html_url] | @csv'
+}
+
+function print_latest_release() {
+    get_latest_release | \
+        awk -vFPAT='([^,]*)|("[^"]+")' '
+        {
+            releasename=$1;
+            link=$2;
+            body=$3;
+            gsub("\"", "", releasename);
+            gsub("\"", "", link);
+            printf("%s\n", releasename)
+            printf("Download link: %s\n", link)
+        };
+        '
+}
+
+function get_assigned_issues() {
+    #accept header for multiple assignees
+    curl -L -s \
+        -H "Authorization: token $GITHUB_TOKEN" \
+        -H "Accept: application/vnd.github.cerberus-preview" \
+        "$API_URL/issues?state=open&per_page=100&assignee=*" \
+        | jq -r 'map(select(.pull_request == null))'
+}
+
+function print_assigned_issues() {
+    assigned=$(get_assigned_issues)
+    if [ $(echo $assigned | jq -r 'length') -eq 0 ]; then
+        echo "Nothing to report"
+        return 0
+    fi
+    echo $assigned | jq -r 'map(
+        [
+            .title,
+            (.assignees | map([.login] | join(",")) | join(",")),
+            (.labels | map([.name] | join(",")) | join(","))
+        ] | @csv) | join("\n")
+    ' | \
+        awk -vFPAT='([^,]*)|("[^"]+")' '
+        {
+            name=$1
+            users=$2
+            labels=$3
+            gsub("\"", "", labels);
+            gsub("\"", "", name);
+            gsub("\"", "", users);
+            if (length(labels) == 0) {
+                labels="Uncategorized"
+            }
+            printf("%d. %s: %s\n", NR, name, labels)
+            printf("Assigned to %s\n\n", users)
+        }
+    '
+}
+
+function print_all() {
+    echo "Summary for $(echo $REPO | cut -d \/ -f 2) team"
+    echo "Activity since $(date --date=$BEGINDATEISO "+%a %b %d %Y")"
+    echo
+
+    issuedata=$(get_github_data "issues")
+    prdata=$(get_github_data "pulls")
+
+    filteredissues=$(echo $issuedata | jq -r 'map(select(.pull_request == null))')
+    filteredprs=$(echo $prdata | jq -r 'map(select((.updated_at | fromdateiso8601 > '$BEGINDATETIMESTAMP')))')
+
+    recentopenissues=$(echo $filteredissues | jq -r 'map(select(.state == "open" and (.created_at | fromdateiso8601 > '$BEGINDATETIMESTAMP')))')
+    recentclosedissues=$(echo $filteredissues | jq -r 'map(select(.state == "closed"))')
+
+    recentopenprs=$(echo $filteredprs | jq -r 'map(select((.merged_at == null and .state == "open")))')
+
+    recentmergedprs=$(echo $filteredprs | jq -r 'map(select((.merged_at != null and .state == "closed")))')
+
+    echo "Current Tasking"
+    print_assigned_issues
+
+    echo "Opened Pull Requests"
+    print_prs "$recentopenprs"
+    echo
+
+    echo "Merged Pull Requests"
+    print_prs "$recentmergedprs"
+    echo
+
+
+    echo "Newly Opened Issues"
+    print_issues "$recentopenissues"
+    echo
+
+    echo "Closed/Resolved Issues"
+    print_issues "$recentclosedissues"
+    echo
+
+    echo "Latest Release"
+    print_latest_release
+}
+
+print_all
